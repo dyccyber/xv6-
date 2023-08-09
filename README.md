@@ -1,2 +1,2 @@
-# xv6-
-xv6，ubuntu
+# xv6
+xv6实验代码仓库
