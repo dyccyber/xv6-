@@ -1,0 +1,5 @@
+（1）可以加速fork()，通过在struct usyscall中添加一个parent数据，以供child们需要的时候在用户态直接使用USYSCALL页面调用，而不用切换到内核态
+page0: date and text of process
+page1: guard page for protect stack by present page0 overflow
+page2: stack of process
+page3 to last page: heap, trapfram, trampoline

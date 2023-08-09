@@ -1,0 +1,304 @@
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..9403095 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -63,6 +63,8 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++void            increment_refcount(uint64 pa);
++int             get_refcount(uint64 pa);
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -145,7 +147,8 @@ void            trapinit(void);
+ void            trapinithart(void);
+ extern struct spinlock tickslock;
+ void            usertrapret(void);
+-
++int             is_cowpage(pagetable_t pagetable, uint64 va);
++void*           cow_alloc(pagetable_t pagetable, uint64 va);
+ // uart.c
+ void            uartinit(void);
+ void            uartintr(void);
+@@ -170,6 +173,8 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++pte_t *         walk(pagetable_t pagetable, uint64 va, int alloc);
++
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..f3b194b 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -19,10 +19,19 @@ struct run {
+ };
+ 
+ struct {
+-  struct spinlock lock;
+-  struct run *freelist;
++   struct spinlock lock;
++   struct run *freelist;
++   uint8 ref_count[(PHYSTOP - KERNBASE) / PGSIZE]; 
+ } kmem;
+ 
++
++
++void
++increment_refcount(uint64 pa){
++   acquire(&kmem.lock);
++   kmem.ref_count[(pa - KERNBASE) / PGSIZE]++;
++   release(&kmem.lock);
++}
+ void
+ kinit()
+ {
+@@ -30,19 +39,20 @@ kinit()
+   freerange(end, (void*)PHYSTOP);
+ }
+ 
++/* kernel/kalloc.c */
+ void
+ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint64)pa_start);
+-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+-    kfree(p);
++  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
++    acquire(&kmem.lock);
++    kmem.ref_count[((uint64)p - KERNBASE) / PGSIZE] = 1;
++    release(&kmem.lock);
++    kfree(p);    
++  }
+ }
+ 
+-// Free the page of physical memory pointed at by v,
+-// which normally should have been returned by a
+-// call to kalloc().  (The exception is when
+-// initializing the allocator; see kinit above.)
+ void
+ kfree(void *pa)
+ {
+@@ -51,32 +61,51 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
+-  // Fill with junk to catch dangling refs.
+-  memset(pa, 1, PGSIZE);
+-
+-  r = (struct run*)pa;
+-
++  // kfree() should only place a page back on the free list
++  // if its reference count is zero.
++  // decrement a page's count each time any process drops the page from its page table.
++  // NOTE: if drops the page, we must call kfree() finally
+   acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++  if(--kmem.ref_count[((uint64)pa - KERNBASE) / PGSIZE] == 0){
++    release(&kmem.lock);
++    // Fill with junk to catch dangling refs.
++    memset(pa, 1, PGSIZE);
++
++    r = (struct run*)pa;
++    
++    acquire(&kmem.lock);
++    r->next = kmem.freelist;
++    kmem.freelist = r;
++    release(&kmem.lock);
++  }
++  else
++    release(&kmem.lock);
+ }
+ 
++
+ // Allocate one 4096-byte page of physical memory.
+ // Returns a pointer that the kernel can use.
+ // Returns 0 if the memory cannot be allocated.
++/* kernel/kalloc.c */
+ void *
+ kalloc(void)
+ {
+   struct run *r;
+-
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  if(r){
++    kmem.ref_count[((uint64)r - KERNBASE) / PGSIZE] = 1;
+     kmem.freelist = r->next;
++  }
+   release(&kmem.lock);
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+   return (void*)r;
+ }
++
++int
++get_refcount(uint64 pa)
++{
++  return kmem.ref_count[(pa - KERNBASE) / PGSIZE];
++}
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..398336e 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,7 @@ sfence_vma()
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_COW (1L << 8) // 是否为懒复制页，使用页表项 flags 中保留的第 8 位表示、
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..aff28e7 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -65,7 +65,18 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
+-  } else if((which_dev = devintr()) != 0){
++  } 
++   else if(r_scause() == 15){  
++    // 如果是我们需要处理的page fault
++    uint64 fault_va = r_stval();//此时发生错误的虚拟地址
++    //is_cowpage 判断是不是cow页，cow_alloc给cow页分配物理页
++    if(fault_va > p->sz ||
++       is_cowpage(p->pagetable, fault_va) < 0 ||
++       cow_alloc(p->pagetable, PGROUNDDOWN(fault_va)) == 0
++    )
++    p->killed = 1;
++  }
++   else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+@@ -82,7 +93,49 @@ usertrap(void)
+ 
+   usertrapret();
+ }
++/* It is cowpage? */
++/* if YES return 0; else return -1 */
++int 
++is_cowpage(pagetable_t pagetable, uint64 va) 
++{
++  pte_t* pte = walk(pagetable, va, 0);//walk函数用于寻找pagetable，找到了再检测其pte_cow
++  return (*pte & PTE_COW ? 0 : -1);
++}
+ 
++/* allocte a phycial memory page for a cow page */
++/* if OK return memory pointer of void*; else return 0 */
++void*
++cow_alloc(pagetable_t pagetable, uint64 va)
++{
++  pte_t *pte = walk(pagetable, va, 0);
++  uint64 pa = PTE2PA(*pte);
++  if(get_refcount(pa) == 1){
++    *pte |= PTE_W;
++    *pte &= ~PTE_COW;
++    return (void*)pa;
++  }
++  uint flags;
++  char *new_mem;
++  //设置pte_w位
++  *pte |= PTE_W;
++  flags = PTE_FLAGS(*pte);
++  //分配物理页，复制，然后映射
++  pa = PTE2PA(*pte);
++  new_mem = kalloc();
++  if(new_mem == 0)
++    return 0;
++  memmove(new_mem, (char*)pa, PGSIZE);
++  *pte &= ~PTE_V;
++  if(mappages(pagetable, va, PGSIZE, (uint64)new_mem, flags) != 0){
++    *pte |= PTE_V;
++    kfree(new_mem);
++    return 0;
++  }
++  //引用计数减一
++  kfree((char*)PGROUNDDOWN(pa));
++
++  return new_mem;
++}
+ //
+ // return to user space
+ //
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..38a8525 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -297,13 +297,13 @@ uvmfree(pagetable_t pagetable, uint64 sz)
+ // physical memory.
+ // returns 0 on success, -1 on failure.
+ // frees any allocated pages on failure.
++/* kernel/vm.c */
+ int
+ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+ {
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+@@ -311,12 +311,18 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+     if((*pte & PTE_V) == 0)
+       panic("uvmcopy: page not present");
+     pa = PTE2PA(*pte);
++
++    // 页面引用次数加1 
++    increment_refcount(PGROUNDDOWN(pa)); 
++    if (*pte & PTE_W){
++      //清除pte_w
++      *pte &= (~PTE_W);
++      //加入pte_cow，标志这个页面是写时复制的物理页
++      *pte |= PTE_COW;
++    }
++    //将父进程的物理页直接映射到子进程
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+       goto err;
+     }
+   }
+@@ -327,6 +333,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   return -1;
+ }
+ 
++
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+ void
+@@ -356,6 +363,11 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+       n = len;
++    if(is_cowpage(pagetable, va0) == 0)
++      // if it is a cowpage, we need a new pa0 pointer to a new memory
++      // and if it is a null pointer, we need return error of -1
++      if ((pa0 = (uint64)cow_alloc(pagetable, va0)) == 0)
++        return -1;
+     memmove((void *)(pa0 + (dstva - va0)), src, n);
+ 
+     len -= n;
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..56a6051
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++1
+\ No newline at end of file

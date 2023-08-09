@@ -1,0 +1,460 @@
+diff --git a/Makefile b/Makefile
+index 7a7e380..4dfc95c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,7 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
++    $U/_mmaptest\
+ 
+ 
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..3780a9f 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -9,6 +9,8 @@ struct sleeplock;
+ struct stat;
+ struct superblock;
+ 
++struct vma *findvma(struct proc *p, uint64 va);
++int vmatrylazytouch(uint64 va);
+ // bio.c
+ void            binit(void);
+ struct buf*     bread(uint, uint);
+@@ -170,6 +172,8 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++pte_t *         walk(pagetable_t pagetable, uint64 va, int alloc);
++void            vmaunmap(pagetable_t pagetable, uint64 va, uint64 nbytes, struct vma *v);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/memlayout.h b/kernel/memlayout.h
+index 776f98c..06faa26 100644
+--- a/kernel/memlayout.h
++++ b/kernel/memlayout.h
+@@ -65,3 +65,4 @@
+ //   TRAPFRAME (p->trapframe, used by the trampoline)
+ //   TRAMPOLINE (the same page as in the kernel)
+ #define TRAPFRAME (TRAMPOLINE - PGSIZE)
++#define MMAPEND TRAPFRAME
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..94b8780 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -141,6 +141,10 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++
++  for(int i=0;i<NVMA;i++) {
++    p->vmas[i].valid = 0;
++  }
+   return p;
+ }
+ 
+@@ -153,6 +157,10 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
++  for(int i = 0; i < NVMA; i++) {
++    struct vma *v = &p->vmas[i];
++    vmaunmap(p->pagetable, v->vastart, v->sz, v);
++  }
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+@@ -300,7 +308,13 @@ fork(void)
+     if(p->ofile[i])
+       np->ofile[i] = filedup(p->ofile[i]);
+   np->cwd = idup(p->cwd);
+-
++  for(i = 0; i < NVMA; i++) {
++    struct vma *v = &p->vmas[i];
++    if(v->valid) {
++      np->vmas[i] = *v;
++      filedup(v->f);
++    }
++  }
+   safestrcpy(np->name, p->name, sizeof(p->name));
+ 
+   pid = np->pid;
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..17c65e3 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -82,20 +82,26 @@ struct trapframe {
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++struct vma {
++  int valid;
++  uint64 vastart;
++  uint64 sz;
++  struct file *f;
++  int prot;
++  int flags;
++  uint64 offset;
++};
++#define NVMA 16
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+-
+   // p->lock must be held when using these:
+   enum procstate state;        // Process state
++  struct proc *parent;         // Parent process
+   void *chan;                  // If non-zero, sleeping on chan
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
+-
+-  // wait_lock must be held when using this:
+-  struct proc *parent;         // Parent process
+-
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+   uint64 sz;                   // Size of process memory (bytes)
+@@ -105,4 +111,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
+-};
++  struct vma vmas[NVMA];       // virtual memory areas
++};
+\ No newline at end of file
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..e0cee37 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,9 @@ sfence_vma()
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_G (1L << 5) // global mapping
++#define PTE_A (1L << 6) // accessed
++#define PTE_D (1L << 7) // dirty
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..b8c9a14 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_mmap(void);
++extern uint64 sys_munmap(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_mmap]   sys_mmap,
++[SYS_munmap]   sys_munmap,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..f41211b 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_mmap   22
++#define SYS_munmap  23
+\ No newline at end of file
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..3c7cd2f 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -15,7 +15,54 @@
+ #include "sleeplock.h"
+ #include "file.h"
+ #include "fcntl.h"
++#include "memlayout.h"
+ 
++// kernel/sysfile.c
++
++// 通过一个虚拟地址，找到该虚拟地址所对应的vma结构体
++struct vma *findvma(struct proc *p, uint64 va) {
++  for(int i=0;i<NVMA;i++) {
++    struct vma *vv = &p->vmas[i];
++    if(vv->valid == 1 && va >= vv->vastart && va < vv->vastart + vv->sz) {
++      return vv;
++    }
++  }
++  return 0;
++}
++
++int vmatrylazytouch(uint64 va) {
++  struct proc *p = myproc();
++  //如果这个页面缺失在vma中，是一个懒分配页，才为它进行映射
++  struct vma *v = findvma(p, va);
++  if(v == 0) {
++    return 0;
++  }
++  // 分配物理页
++  void *pa = kalloc();
++  if(pa == 0) {
++    panic("vmalazytouch: kalloc");
++  }
++  memset(pa, 0, PGSIZE);
++  //从磁盘中读数据
++  begin_op();
++  ilock(v->f->ip);
++  readi(v->f->ip, 0, (uint64)pa, v->offset + PGROUNDDOWN(va - v->vastart), PGSIZE);
++  iunlock(v->f->ip);
++  end_op();
++  //设置对应的位，完成映射
++  int perm = PTE_U;
++  if(v->prot & PROT_READ)
++    perm |= PTE_R;
++  if(v->prot & PROT_WRITE)
++    perm |= PTE_W;
++  if(v->prot & PROT_EXEC)
++    perm |= PTE_X;
++  if(mappages(p->pagetable, va, PGSIZE, (uint64)pa, PTE_R | PTE_W | PTE_U) < 0) {
++    panic("vmalazytouch: mappages");
++  }
++
++  return 1;
++}
+ // Fetch the nth word-sized system call argument as a file descriptor
+ // and return both the descriptor and the corresponding struct file.
+ static int
+@@ -52,6 +99,100 @@ fdalloc(struct file *f)
+   return -1;
+ }
+ 
++// kernel/sysfile.c
++
++uint64
++sys_munmap(void)
++{
++  uint64 addr, sz;
++  if(argaddr(0, &addr) < 0 || argaddr(1, &sz) < 0 || sz == 0)
++    return -1;
++  struct proc *p = myproc();
++  //找到对应的vma结构体
++  struct vma *v = findvma(p, addr);
++  if(v == 0) {
++    return -1;
++  }
++  //检测了一下在 vma 区域中间“挖洞”释放的错误情况，计算出应该开始释放的内存地址以及应该释放的内存字节数量
++  //由于页有可能不是完整释放，如果 addr 处于一个页的中间，则那个页的后半部分释放，但是前半部分不释放，
++  //此时该页整体不应该被释放
++  if(addr > v->vastart && addr + sz < v->vastart + v->sz) {
++    return -1;
++  }
++  //计算释放内存页的开始地址以及释放的个数
++  uint64 addr_aligned = addr;
++  if(addr > v->vastart) {
++    addr_aligned = PGROUNDUP(addr);
++  }
++  int nunmap = sz - (addr_aligned-addr); 
++  if(nunmap < 0)
++    nunmap = 0;
++  //调用自定义的 vmaunmap 方法（vm.c）对物理内存页进行释放，并在需要的时候将数据写回磁盘
++  vmaunmap(p->pagetable, addr_aligned, nunmap, v); 
++  //修改相应的vma结构体信息
++  if(addr <= v->vastart && addr + sz > v->vastart) { 
++    v->offset += addr + sz - v->vastart;
++    v->vastart = addr + sz;
++  }
++  v->sz -= sz;
++  //关闭对该文件的引用
++  if(v->sz <= 0) {
++    fileclose(v->f);
++    v->valid = 0;
++  }
++  return 0;  
++}
++// kernel/sysfile.c
++
++uint64
++sys_mmap(void)
++{
++  uint64 addr, sz, offset;
++  int prot, flags, fd; struct file *f;
++
++  if(argaddr(0, &addr) < 0 || argaddr(1, &sz) < 0 || argint(2, &prot) < 0
++    || argint(3, &flags) < 0 || argfd(4, &fd, &f) < 0 || argaddr(5, &offset) < 0 || sz == 0)
++    return -1;
++  
++  if((!f->readable && (prot & (PROT_READ)))
++     || (!f->writable && (prot & PROT_WRITE) && !(flags & MAP_PRIVATE)))
++    return -1;
++  
++  sz = PGROUNDUP(sz);
++
++  struct proc *p = myproc();
++  struct vma *v = 0;
++  uint64 vaend = MMAPEND; // non-inclusive
++  
++  // 寻找空闲的vma，顺便计算使用的最低的虚拟地址，作为vaend
++  for(int i=0;i<NVMA;i++) {
++    struct vma *vv = &p->vmas[i];
++    if(vv->valid == 0) {
++      if(v == 0) {
++        v = &p->vmas[i];
++        v->valid = 1;
++      }
++    } else if(vv->vastart < vaend) {
++      vaend = PGROUNDDOWN(vv->vastart);
++    }
++  }
++  if(v == 0){
++    panic("mmap: no free vma");
++  }
++  //将文件映射到start到end的位置，设置相应的vma信息
++  v->vastart = vaend - sz;
++  v->sz = sz;
++  v->prot = prot;
++  v->flags = flags;
++  v->f = f;
++  v->offset = offset;
++
++  filedup(v->f);
++
++  return v->vastart;
++}
++
++
+ uint64
+ sys_dup(void)
+ {
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..ec6ce2e 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -7,6 +7,7 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ 
++
+ uint64
+ sys_exit(void)
+ {
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..deaa6fd 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -68,9 +68,17 @@ usertrap(void)
+   } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+-    printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+-    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+-    p->killed = 1;
++      uint64 va = r_stval();
++    if((r_scause() == 13 || r_scause() == 15)){ 
++      if(!vmatrylazytouch(va)) {
++        goto unexpected_scause;
++      }
++    } else {
++      unexpected_scause:
++      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
++      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
++      p->killed = 1;
++    }
+   }
+ 
+   if(p->killed)
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..8975eda 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,6 +5,11 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
++#include "fcntl.h"
++#include "spinlock.h"
++#include "sleeplock.h"
++#include "file.h"
++#include "proc.h"
+ 
+ /*
+  * the kernel's page table.
+@@ -15,6 +20,39 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
+ 
+ extern char trampoline[]; // trampoline.S
+ 
++
++void
++vmaunmap(pagetable_t pagetable, uint64 va, uint64 nbytes, struct vma *v)
++{
++  uint64 a;
++  pte_t *pte;
++  for(a = va; a < va + nbytes; a += PGSIZE){
++    //walk函数：为虚拟地址找到pte
++    if((pte = walk(pagetable, a, 0)) == 0)
++      panic("sys_munmap: walk");
++    if(PTE_FLAGS(*pte) == PTE_V)
++      panic("sys_munmap: not a leaf");
++    if(*pte & PTE_V){
++      uint64 pa = PTE2PA(*pte);
++      if((*pte & PTE_D) && (v->flags & MAP_SHARED)) { //已经被修改过，需要写回磁盘
++        begin_op();
++        ilock(v->f->ip);
++        uint64 aoff = a - v->vastart; 
++        if(aoff < 0) { //假如首页不是一个完整的页面，确定首页范围写回
++          writei(v->f->ip, 0, pa + (-aoff), v->offset, PGSIZE + aoff);
++        } else if(aoff + PGSIZE > v->sz){  // 如果尾页不是一个完整的页面，确定尾页范围写回
++          writei(v->f->ip, 0, pa, v->offset + aoff, v->sz - aoff);
++        } else { //已经是一个完整的页面，直接写回一个页面大小
++          writei(v->f->ip, 0, pa, v->offset + aoff, PGSIZE);
++        }
++        iunlock(v->f->ip);
++        end_op();
++      }
++      kfree((void*)pa);
++      *pte = 0;
++    }
++  }
++}
+ // Make a direct-map page table for the kernel.
+ pagetable_t
+ kvmmake(void)
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..56a6051
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++1
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index b71ecda..8c946e3 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++void *mmap(void *addr, int length, int prot, int flags,int fd, int offset);
++int munmap(void *addr, int length);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..d23b9cc 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("mmap");
++entry("munmap");

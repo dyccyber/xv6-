@@ -1,0 +1,263 @@
+diff --git a/answers-pgtbl.txt b/answers-pgtbl.txt
+new file mode 100644
+index 0000000..8ed4ac4
+--- /dev/null
++++ b/answers-pgtbl.txt
+@@ -0,0 +1,5 @@
++（1）可以加速fork()，通过在struct usyscall中添加一个parent数据，以供child们需要的时候在用户态直接使用USYSCALL页面调用，而不用切换到内核态
++page0: date and text of process
++page1: guard page for protect stack by present page0 overflow
++page2: stack of process
++page3 to last page: heap, trapfram, trampoline
+\ No newline at end of file
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..c7ee3ac 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -9,6 +9,9 @@ struct sleeplock;
+ struct stat;
+ struct superblock;
+ 
++
++//声明walk函数
++pte_t *         walk(pagetable_t pagetable, uint64 va, int alloc);
+ // bio.c
+ void            binit(void);
+ struct buf*     bread(uint, uint);
+@@ -170,6 +173,7 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++void            vmprint(pagetable_t);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index d62d29d..a8868a7 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -115,7 +115,9 @@ exec(char *path, char **argv)
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+-
++  //打印页表
++  if(p->pid == 1)
++    vmprint(p->pagetable);
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..ddd910f 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -126,7 +126,15 @@ found:
+     release(&p->lock);
+     return 0;
+   }
++  // 分配 usyscall 页
+ 
++   if((p->usyscall = (struct usyscall *)kalloc()) == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++  memmove(p->usyscall,&p->pid,8);
++  // 创建完了顺便把 pid 直接放进去
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -153,6 +161,9 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
++  if(p->usyscall){
++    kfree((void*)p->usyscall);
++  }
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+@@ -164,6 +175,8 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++  
++ 
+ }
+ 
+ // Create a user page table for a given process,
+@@ -187,7 +200,7 @@ proc_pagetable(struct proc *p)
+     uvmfree(pagetable, 0);
+     return 0;
+   }
+-
++  
+   // map the trapframe just below TRAMPOLINE, for trampoline.S.
+   if(mappages(pagetable, TRAPFRAME, PGSIZE,
+               (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
+@@ -195,6 +208,16 @@ proc_pagetable(struct proc *p)
+     uvmfree(pagetable, 0);
+     return 0;
+   }
++  
++  //新加入代码
++  
++  if(mappages(pagetable, USYSCALL, PGSIZE,
++               (uint64)(p->usyscall), PTE_R | PTE_U) < 0){
++    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++    uvmunmap(pagetable, TRAPFRAME, 1, 0);
++    uvmfree(pagetable, 0);
++    return 0;
++  }
+ 
+   return pagetable;
+ }
+@@ -206,6 +229,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmunmap(pagetable, USYSCALL, 1, 0); // 新添加的
+   uvmfree(pagetable, sz);
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..71e927f 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -105,4 +105,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  struct usyscall *usyscall;   // record info of syscall(pid) 
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..86f9f2c 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -338,11 +338,13 @@ sfence_vma()
+ #define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
+ #define PGROUNDDOWN(a) (((a)) & ~(PGSIZE-1))
+ 
++
+ #define PTE_V (1L << 0) // valid
+ #define PTE_R (1L << 1)
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_A (1L << 6) // 左移六位
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3bd0007..e1496e8 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -7,6 +7,8 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ 
++
++
+ uint64
+ sys_exit(void)
+ {
+@@ -80,8 +82,52 @@ sys_sleep(void)
+ int
+ sys_pgaccess(void)
+ {
+-  // lab pgtbl: your code here.
+-  return 0;
++  // lab pgtbl: your code here.  
++  uint64 base;
++  uint64 mask;  
++  int len;  
++ 
++  pagetable_t pagetable = 0;  
++  unsigned int procmask = 0 ;
++  pte_t *pte;
++ 
++  struct proc *p = myproc();
++ 
++  if(argaddr(0, &base) < 0 || argint(1, &len) < 0 || argaddr(2, &mask) < 0)
++    return -1;
++  if (len > sizeof(int)*8) 
++    len = sizeof(int)*8;
++ 
++  for(int i=0; i<len; i++) {
++    pagetable = p->pagetable;
++      
++    if(base >= MAXVA)
++      panic("pgaccess");
++ 
++    for(int level = 2; level > 0; level--) {
++      pte = &pagetable[PX(level, base)];
++      if(*pte & PTE_V) {
++        pagetable = (pagetable_t)PTE2PA(*pte);
++      } else {
++        return -1;
++      }      
++    }
++    pte = &pagetable[PX(0, base)];
++    if(pte == 0)
++      return -1;
++    if((*pte & PTE_V) == 0)
++      return -1;
++    if((*pte & PTE_U) == 0)
++      return -1;  
++    if(*pte & PTE_A) {  
++      procmask = procmask | (1L << i);
++      *pte = *pte & (~PTE_A);
++    }
++    base += PGSIZE;
++  }
++ 
++  pagetable = p->pagetable;
++  return copyout(pagetable, mask, (char *) &procmask, sizeof(unsigned int));
+ }
+ #endif
+ 
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..8a5d7b8 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -15,6 +15,32 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
+ 
+ extern char trampoline[]; // trampoline.S
+ 
++
++void 
++printwalk(pagetable_t pagetable, uint level) {
++  char* prefix;
++  if (level == 2) prefix = "..";
++  else if (level == 1) prefix = ".. ..";
++  else prefix = ".. .. ..";
++  for(int i = 0; i < 512; i++){ // 每个页表有512项
++    pte_t pte = pagetable[i];
++    if(pte & PTE_V){ // 该页表项有效
++      uint64 pa = PTE2PA(pte); // 将虚拟地址转换为物理地址
++      printf("%s%d: pte %p pa %p\n", prefix, i, pte, pa);
++      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){ // 有下一级页表
++         printwalk((pagetable_t)pa, level - 1);
++      }
++    }
++  }
++}
++ 
++void
++vmprint(pagetable_t pagetable) {
++  printf("page table %p\n", pagetable);
++  printwalk(pagetable, 2);
++}
++
++
+ // Make a direct-map page table for the kernel.
+ pagetable_t
+ kvmmake(void)
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..56a6051
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++1
+\ No newline at end of file

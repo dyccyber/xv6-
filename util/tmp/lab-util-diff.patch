@@ -1,0 +1,466 @@
+diff --git a/Makefile b/Makefile
+index c926b7e..3150583 100644
+--- a/Makefile
++++ b/Makefile
+@@ -193,9 +193,13 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
+-
+-
++	$U/_sleep\
++	$U/_pingpong\
++	$U/_primes\
++    $U/_find\
++    $U/_xargs\
++  
++	
+ 
+ ifeq ($(LAB),$(filter $(LAB), pgtbl lock))
+ UPROGS += \
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..b6b2a83 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -64,6 +64,8 @@ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
+ 
++
++
+ // log.c
+ void            initlog(int, struct superblock*);
+ void            log_write(struct buf*);
+@@ -105,6 +107,7 @@ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
+ 
++
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+ 
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..c6e29c2 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -80,3 +80,6 @@ kalloc(void)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+   return (void*)r;
+ }
++
++
++
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..c1e9f73 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -42,6 +42,8 @@ proc_mapstacks(pagetable_t kpgtbl) {
+   }
+ }
+ 
++
++
+ // initialize the proc table at boot time.
+ void
+ procinit(void)
+@@ -141,6 +143,7 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++ 
+   return p;
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..c1e9f68 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -105,4 +105,6 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++ 
+ };
++
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..824cb49 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -105,6 +105,8 @@ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
+ 
++
++
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+ [SYS_exit]    sys_exit,
+@@ -127,6 +129,33 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++
++};
++
++
++const char *syscall_names[] = {
++[SYS_fork]    "fork",
++[SYS_exit]    "exit",
++[SYS_wait]    "wait",
++[SYS_pipe]    "pipe",
++[SYS_read]    "read",
++[SYS_kill]    "kill",
++[SYS_exec]    "exec",
++[SYS_fstat]   "fstat",
++[SYS_chdir]   "chdir",
++[SYS_dup]     "dup",
++[SYS_getpid]  "getpid",
++[SYS_sbrk]    "sbrk",
++[SYS_sleep]   "sleep",
++[SYS_uptime]  "uptime",
++[SYS_open]    "open",
++[SYS_write]   "write",
++[SYS_mknod]   "mknod",
++[SYS_unlink]  "unlink",
++[SYS_link]    "link",
++[SYS_mkdir]   "mkdir",
++[SYS_close]   "close",
++
+ };
+ 
+ void
+@@ -136,8 +165,9 @@ syscall(void)
+   struct proc *p = myproc();
+ 
+   num = p->trapframe->a7;
+-  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+-    p->trapframe->a0 = syscalls[num]();
++  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) { // 如果系统调用编号有效
++    p->trapframe->a0 = syscalls[num](); // 通过系统调用编号，获取系统调用处理函数的指针，调用并将返回值存到用户进程的 a0 寄存器中
++	
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+             p->pid, p->name, num);
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..bbf0433 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++
++
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..454bbc5 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -7,6 +7,10 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ 
++
++
++
++
+ uint64
+ sys_exit(void)
+ {
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..56a6051
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++1
+\ No newline at end of file
+diff --git a/user/find.c b/user/find.c
+new file mode 100644
+index 0000000..99ac5d6
+--- /dev/null
++++ b/user/find.c
+@@ -0,0 +1,68 @@
++// find.c
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++
++void find(char *path, char *target) {
++	char buf[512], *p;
++	int fd;
++	struct dirent de;
++	struct stat st;
++
++	if((fd = open(path, 0)) < 0){
++		fprintf(2, "find: cannot open %s\n", path);
++		return;
++	}
++
++	if(fstat(fd, &st) < 0){
++		fprintf(2, "find: cannot stat %s\n", path);
++		close(fd);
++		return;
++	}
++
++	switch(st.type){
++	case T_FILE:
++		// 如果文件名结尾匹配 `/target`，则视为匹配
++		if(strcmp(path+strlen(path)-strlen(target), target) == 0) {
++			printf("%s\n", path);
++		}
++		break;
++	case T_DIR:
++		if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
++			printf("find: path too long\n");
++			break;
++		}
++		strcpy(buf, path);
++		p = buf+strlen(buf);
++		*p++ = '/';
++		while(read(fd, &de, sizeof(de)) == sizeof(de)){
++			if(de.inum == 0)
++				continue;
++			memmove(p, de.name, DIRSIZ);
++			p[DIRSIZ] = 0;
++			if(stat(buf, &st) < 0){
++				printf("find: cannot stat %s\n", buf);
++				continue;
++			}
++			// 不要进入 `.` 和 `..`
++			if(strcmp(buf+strlen(buf)-2, "/.") != 0 && strcmp(buf+strlen(buf)-3, "/..") != 0) {
++				find(buf, target); // 递归查找
++			}
++		}
++		break;
++	}
++	close(fd);
++}
++
++int main(int argc, char *argv[])
++{
++	if(argc < 3){
++		exit(0);
++	}
++	char target[512];
++	target[0] = '/'; // 为查找的文件名添加 / 在开头
++	strcpy(target+1, argv[2]);
++	find(argv[1], target);
++	exit(0);
++}
+\ No newline at end of file
+diff --git a/user/pingpong.c b/user/pingpong.c
+new file mode 100644
+index 0000000..b993300
+--- /dev/null
++++ b/user/pingpong.c
+@@ -0,0 +1,26 @@
++// pingpong.c
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int main(int argc, char **argv) {
++	// 创建管道会得到一个长度为 2 的 int 数组
++	// 其中 0 为用于从管道读取数据的文件描述符，1 为用于向管道写入数据的文件描述符
++	int pp2c[2], pc2p[2];
++	pipe(pp2c); // 创建用于 父进程 -> 子进程 的管道
++	pipe(pc2p); // 创建用于 子进程 -> 父进程 的管道
++	
++	if(fork() != 0) { // parent process
++		write(pp2c[1], "!", 1); // 1. 父进程首先向发出该字节
++		char buf;
++		read(pc2p[0], &buf, 1); // 2. 父进程发送完成后，开始等待子进程的回复
++		printf("%d: received pong\n", getpid()); // 5. 子进程收到数据，read 返回，输出 pong
++		wait(0);
++	} else { // child process
++		char buf;
++		read(pp2c[0], &buf, 1); // 3. 子进程读取管道，收到父进程发送的字节数据
++		printf("%d: received ping\n", getpid());
++		write(pc2p[1], &buf, 1); // 4. 子进程通过 子->父 管道，将字节送回父进程
++	}
++	exit(0);
++}
+\ No newline at end of file
+diff --git a/user/primes.c b/user/primes.c
+new file mode 100644
+index 0000000..6b96149
+--- /dev/null
++++ b/user/primes.c
+@@ -0,0 +1,63 @@
++// primes.c
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++// 一次 sieve 调用是一个筛子阶段，会从 pleft 获取并输出一个素数 p，筛除 p 的所有倍数
++// 同时创建下一 stage 的进程以及相应输入管道 pright，然后将剩下的数传到下一 stage 处理
++void sieve(int pleft[2]) { // pleft 是来自该 stage 左端进程的输入管道
++	int p;
++	read(pleft[0], &p, sizeof(p)); // 读第一个数，必然是素数
++	if(p == -1) { // 如果是哨兵 -1，则代表所有数字处理完毕，退出程序
++		exit(0);
++	}
++	printf("prime %d\n", p);
++
++	int pright[2];
++	pipe(pright); // 创建用于输出到下一 stage 的进程的输出管道 pright
++
++	if(fork() == 0) {
++		// 子进程 （下一个 stage）
++		close(pright[1]); // 子进程只需要对输入管道 pright 进行读，而不需要写，所以关掉子进程的输入管道写文件描述符，降低进程打开的文件描述符数量
++		close(pleft[0]); // 这里的 pleft 是*父进程*的输入管道，子进程用不到，关掉
++		sieve(pright); // 子进程以父进程的输出管道作为输入，开始进行下一个 stage 的处理。
++
++	} else {
++		// 父进程 （当前 stage）
++		close(pright[0]); // 同上，父进程只需要对子进程的输入管道进行写而不需要读，所以关掉父进程的读文件描述符
++		int buf;
++		while(read(pleft[0], &buf, sizeof(buf)) && buf != -1) { // 从左端的进程读入数字
++			if(buf % p != 0) { // 筛掉能被该进程筛掉的数字
++				write(pright[1], &buf, sizeof(buf)); // 将剩余的数字写到右端进程
++			}
++		}
++		buf = -1;
++		write(pright[1], &buf, sizeof(buf)); // 补写最后的 -1，标示输入完成。
++		wait(0); // 等待该进程的子进程完成，也就是下一 stage
++		exit(0);
++	}
++}
++
++int main(int argc, char **argv) {
++	// 主进程
++	int input_pipe[2];
++	pipe(input_pipe); // 准备好输入管道，输入 2 到 35 之间的所有整数。
++
++	if(fork() == 0) {
++		// 第一个 stage 的子进程
++		close(input_pipe[1]); // 子进程只需要读输入管道，而不需要写，关掉子进程的管道写文件描述符
++		sieve(input_pipe);
++		exit(0);
++	} else {
++		// 主进程
++		close(input_pipe[0]); // 同上
++		int i;
++		for(i=2;i<=35;i++){ // 生成 [2, 35]，输入管道链最左端
++			write(input_pipe[1], &i, sizeof(i));
++		}
++		i = -1;
++		write(input_pipe[1], &i, sizeof(i)); // 末尾输入 -1，用于标识输入完成
++	}
++	wait(0); // 等待第一个 stage 完成。注意：这里无法等待子进程的子进程，只能等待直接子进程，无法等待间接子进程。在 sieve() 中会为每个 stage 再各自执行 wait(0)，形成等待链。
++	exit(0);
++}
+\ No newline at end of file
+diff --git a/user/sleep.c b/user/sleep.c
+new file mode 100644
+index 0000000..27e8a79
+--- /dev/null
++++ b/user/sleep.c
+@@ -0,0 +1,11 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h" // 必须以这个顺序 include，由于三个头文件有依赖关系
++
++int main(int argc, char **argv) {
++	if(argc < 2) {
++		printf("usage: sleep <ticks>\n");
++	}
++	sleep(atoi(argv[1]));
++	exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index b71ecda..089f888 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,6 +1,6 @@
+ struct stat;
+ struct rtcdate;
+-
++struct sysinfo;
+ // system calls
+ int fork(void);
+ int exit(int) __attribute__((noreturn));
+@@ -24,6 +24,8 @@ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
+ 
++
++
+ // ulib.c
+ int stat(const char*, struct stat*);
+ char* strcpy(char*, const char*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..8a07d98 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++
++
+diff --git a/user/xargs.c b/user/xargs.c
+new file mode 100644
+index 0000000..1e0ee73
+--- /dev/null
++++ b/user/xargs.c
+@@ -0,0 +1,55 @@
++// xargs.c
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++
++// 带参数列表，执行某个程序
++void run(char *program, char **args) {
++	if(fork() == 0) { // child exec
++		exec(program, args);
++		exit(0);
++	}
++	return; // parent return
++}
++
++int main(int argc, char *argv[]){
++	char buf[2048]; // 读入时使用的内存池
++	char *p = buf, *last_p = buf; // 当前参数的结束、开始指针
++	char *argsbuf[128]; // 全部参数列表，字符串指针数组，包含 argv 传进来的参数和 stdin 读入的参数
++	char **args = argsbuf; // 指向 argsbuf 中第一个从 stdin 读入的参数
++	for(int i=1;i<argc;i++) {
++		// 将 argv 提供的参数加入到最终的参数列表中
++		*args = argv[i];
++		args++;
++	}
++	char **pa = args; // 开始读入参数
++	while(read(0, p, 1) != 0) {
++		if(*p == ' ' || *p == '\n') {
++			// 读入一个参数完成（以空格分隔，如 `echo hello world`，则 hello 和 world 各为一个参数）
++			*p = '\0';	// 将空格替换为 \0 分割开各个参数，这样可以直接使用内存池中的字符串作为参数字符串
++						// 而不用额外开辟空间
++			*(pa++) = last_p;
++			last_p = p+1;
++
++			if(*p == '\n') {
++				// 读入一行完成
++				*pa = 0; // 参数列表末尾用 null 标识列表结束
++				run(argv[1], argsbuf); // 执行最后一行指令
++				pa = args; // 重置读入参数指针，准备读入下一行
++			}
++		}
++		p++;
++	}
++	if(pa != args) { // 如果最后一行不是空行
++		// 收尾最后一个参数
++		*p = '\0';
++		*(pa++) = last_p;
++		// 收尾最后一行
++		*pa = 0; // 参数列表末尾用 null 标识列表结束
++		// 执行最后一行指令
++		run(argv[1], argsbuf);
++	}
++	while(wait(0) != -1) {}; // 循环等待所有子进程完成，每一次 wait(0) 等待一个
++	exit(0);
++}
+\ No newline at end of file
